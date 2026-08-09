@@ -2,15 +2,70 @@ import React, { useEffect, useState } from 'react'
 import { api } from '../api.js'
 import SimSelector from './SimSelector.jsx'
 
+const PANI_ACCESS_TYPES = [
+  'IEEE-802.11', 'IEEE-802.11a', 'IEEE-802.11b', 'IEEE-802.11g', 'IEEE-802.11n',
+  'IEEE-802.11ac', 'IEEE-802.11ax', 'IEEE-802.11be', '3GPP-WLAN',
+]
+
+// Preview-only MCC→ISO hints (authoritative table lives in control/app/mcc_country.py).
+const PREVIEW_MCC_ISO = {
+  '202': 'GR', '204': 'NL', '206': 'BE', '208': 'FR', '214': 'ES', '216': 'HU',
+  '219': 'HR', '222': 'IT', '226': 'RO', '228': 'CH', '230': 'CZ', '232': 'AT',
+  '234': 'GB', '235': 'GB', '238': 'DK', '240': 'SE', '242': 'NO', '244': 'FI',
+  '250': 'RU', '255': 'UA', '260': 'PL', '262': 'DE', '268': 'PT', '272': 'IE',
+  '286': 'TR', '302': 'CA', '310': 'US', '311': 'US', '312': 'US', '313': 'US',
+  '314': 'US', '315': 'US', '316': 'US', '334': 'MX', '404': 'IN', '405': 'IN',
+  '440': 'JP', '441': 'JP', '450': 'KR', '454': 'HK', '455': 'MO', '460': 'CN',
+  '461': 'CN', '466': 'TW', '502': 'MY', '505': 'AU', '510': 'ID', '515': 'PH',
+  '520': 'TH', '525': 'SG', '530': 'NZ', '602': 'EG', '655': 'ZA', '724': 'BR',
+}
+
 const emptyInstance = () => ({
   id: '', name: '', imsi: '', mcc: '', mnc: '', imei: '', imeisv: '', pin: '', reader: '',
   reader_index: 0, reader_port: '', msisdn: '', smsc: '', enabled: true, apn: 'ims', idr_mode: 'apn', cp_mode: 'auto',
-  sip: { listen_addr: '0.0.0.0', transport: 'udp', external: [], webrtc: { enable: true } },
+  use_reauth_id: true,
+  sip: {
+    listen_addr: '0.0.0.0', transport: 'udp', external: [], webrtc: { enable: true },
+    pani_country_enable: true, pani_country: '',
+    pani_node_id_enable: false, pani_node_id: '',
+    pani_access_type: 'IEEE-802.11',
+  },
   debug: { asterisk: true, charon: false },
 })
 
 function Field({ label, children }) {
   return <div><label>{label}</label>{children}</div>
+}
+
+function normalizePreviewCountry(c) {
+  const s = String(c || '').trim().toUpperCase().replace(/[^A-Z]/g, '')
+  return s.length === 2 ? s : ''
+}
+
+function normalizePreviewNodeId(m) {
+  const s = String(m || '').replace(/[^0-9a-fA-F]/g, '').toLowerCase()
+  return /^[0-9a-f]{12}$/.test(s) ? s : ''
+}
+
+/** Client-side preview of the P-Access-Network-Info header that will be sent. */
+function previewPani(sip, mcc) {
+  const s = sip || {}
+  if ((s.pani || '').trim()) return s.pani.trim()
+  const parts = [s.pani_access_type || 'IEEE-802.11']
+  if (s.pani_country_enable !== false) {
+    let c = normalizePreviewCountry(s.pani_country)
+    if (!c) {
+      const key = String(mcc || '').replace(/\D/g, '').slice(0, 3).padStart(3, '0')
+      c = PREVIEW_MCC_ISO[key] || ''
+    }
+    if (c) parts.push(`country=${c}`)
+    else if (mcc) parts.push('country=<from SIM MCC>')
+  }
+  if (s.pani_node_id_enable) {
+    const n = normalizePreviewNodeId(s.pani_node_id)
+    if (n) parts.push(`i-wlan-node-id=${n}`)
+  }
+  return parts.join(';')
 }
 
 export default function SimConfig({ instances, selected, refresh, cards, setSelected }) {
@@ -25,7 +80,13 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   // Refresh the physical-reader list whenever the detected-card set changes (hotplug), so
   // the reader picker never lists a reader that has been unplugged.
   useEffect(() => { api.readers().then((r) => setReaders(r.readers)).catch(() => {}) }, [cards.map((c) => c.name).join(',')])
-  useEffect(() => { if (selected) setForm({ ...emptyInstance(), ...selected }) }, [selected?.id])
+  useEffect(() => {
+    if (!selected) return
+    // Deep-merge sip so new PANI knobs keep their defaults when an older saved
+    // instance has no pani_* keys yet (shallow spread would drop emptyInstance.sip).
+    const base = emptyInstance()
+    setForm({ ...base, ...selected, sip: { ...base.sip, ...(selected.sip || {}) } })
+  }, [selected?.id])
   // Keep the reader selection valid for the CURRENT hardware. A stored reader_index can be
   // stale — saved when more readers were attached — and point past the live reader list; the
   // <select> then has no matching option and "Detect card" probes a phantom reader ("No SIM
@@ -231,6 +292,16 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           <b>IMS address family</b> must match the carrier's IMS PDN. <b>Auto-detect</b> figures it out for you (matches known carriers, else probes families after SIM auth) and pins the one that works — leave this unless you know the carrier needs a specific family. Telus/EE are IPv6; Vodafone UK is IPv4.
         </div>
 
+        <label style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input type="checkbox" style={{ width: 'auto' }}
+            checked={form.use_reauth_id !== false}
+            onChange={(e) => upd({ use_reauth_id: e.target.checked })} />
+          Use EAP-AKA fast re-authentication
+        </label>
+        <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
+          On by default. After a successful attach the carrier's AAA may hand out a short-lived re-authentication identity; presenting it on a reconnect lets the network skip a full SIM auth run. If it has expired the engine notices the rejection and retries with the permanent IMSI identity by itself, so this is safe to leave on. Turn it <b>off</b> for a carrier whose AAA rejects it on every reconnect (O2 UK) to skip that wasted attach attempt.
+        </div>
+
         <h4 style={{ marginBottom: 6 }}>Local SIP access</h4>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
           <Field label="Listen address">
@@ -255,6 +326,50 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         <div style={{ marginTop: 12 }}>
           <label>Device User-Agent (identify to the carrier as this device)</label>
           <input className="mono" value={form.sip.user_agent || ''} onChange={(e) => updSip({ user_agent: e.target.value })} placeholder="iOS/26.6 iPhone" />
+        </div>
+
+        <h4 style={{ marginBottom: 6, marginTop: 16 }}>P-Access-Network-Info</h4>
+        <div style={{ fontSize: 11, color: 'var(--text-mute)', marginBottom: 8 }}>
+          Sent on IMS REGISTER / SIP to identify the Wi-Fi access. Default matches real phones:
+          <code style={{ marginLeft: 4 }}>IEEE-802.11;country=&lt;SIM home country&gt;</code>
+        </div>
+        <Field label="Access type">
+          <select value={form.sip.pani_access_type || 'IEEE-802.11'}
+            onChange={(e) => updSip({ pani_access_type: e.target.value })}>
+            {PANI_ACCESS_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </Field>
+        <label style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input type="checkbox" style={{ width: 'auto' }}
+            checked={form.sip.pani_country_enable !== false}
+            onChange={(e) => updSip({ pani_country_enable: e.target.checked })} />
+          Report country code
+        </label>
+        {form.sip.pani_country_enable !== false && (
+          <div style={{ marginTop: 6 }}>
+            <input className="mono" maxLength={2}
+              value={form.sip.pani_country || ''}
+              onChange={(e) => updSip({ pani_country: e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2) })}
+              placeholder="留空 = 按 SIM 的 MCC 自动推导（如 GB）" />
+          </div>
+        )}
+        <label style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input type="checkbox" style={{ width: 'auto' }}
+            checked={!!form.sip.pani_node_id_enable}
+            onChange={(e) => updSip({ pani_node_id_enable: e.target.checked })} />
+          Report Wi-Fi AP BSSID (i-wlan-node-id)
+        </label>
+        {!!form.sip.pani_node_id_enable && (
+          <div style={{ marginTop: 6 }}>
+            <input className="mono"
+              value={form.sip.pani_node_id || ''}
+              onChange={(e) => updSip({ pani_node_id: e.target.value })}
+              placeholder="000cf1126028" />
+          </div>
+        )}
+        <div className="mono" style={{ marginTop: 10, fontSize: 12, padding: '8px 10px',
+          background: 'var(--bg-elev, rgba(0,0,0,.25))', borderRadius: 6, color: 'var(--text-dim)' }}>
+          Preview: P-Access-Network-Info: {previewPani(form.sip, form.mcc)}
         </div>
 
         <div style={{ marginTop: 12 }}>

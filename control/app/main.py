@@ -67,11 +67,13 @@ class Hub:
         return self.health.setdefault(str(iid), {
             "fail_start": None, "retry_count": 0, "frozen_code": None,
             "frozen_reason": None, "last_state": None,
+            "recovering": False, "last_recover_try": None,
         })
 
     def reset_health(self, iid: str):
         self.health[str(iid)] = {"fail_start": None, "retry_count": 0, "frozen_code": None,
-                                 "frozen_reason": None, "last_state": None}
+                                 "frozen_reason": None, "last_state": None,
+                                 "recovering": False, "last_recover_try": None}
 
     async def drop_ami(self, iid: str):
         """Tear down and forget the AMI client for an instance. MUST be called whenever the
@@ -212,10 +214,11 @@ async def _on_card_insert(name, idx):
              info["iccid"], info["matched"])
     # NOTE: we deliberately do NOT auto-start the matched line here. A card (re)appearing
     # — after an unplug, a reader drop, or a manual Stop — leaves the line stopped and
-    # waiting for the user to press Start / Re-provision on the dashboard. Only failures
-    # that occur DURING an active registration flow trigger the bounded auto-retry
-    # (apply_health, max n attempts). This avoids an endless insert->start->fail->stop
-    # loop and respects a deliberate manual stop.
+    # waiting for the user to press Start / Re-provision on the dashboard. Registration
+    # failures during an active flow use apply_health's bounded timer; network-class
+    # freezes (epdg_unresolved / tunnel_network / tunnel_setup) additionally auto
+    # re-provision once connectivity returns. This avoids an endless insert->start->
+    # fail->stop loop and respects a deliberate manual stop.
 
 
 async def _on_card_remove(entry: dict, reader_unplugged: bool = False) -> bool:
@@ -402,20 +405,42 @@ async def status_poller():
         await asyncio.sleep(4)
 
 
-def _frozen(h, st, rmax):
-    return {"state": "ERROR", "label": status_mod.LABELS["ERROR"],
-            "reason_code": h["frozen_code"], "reason": h["frozen_reason"],
-            "detail": st.get("detail", {}), "retry": {"count": rmax, "max": rmax},
-            "frozen": True}
+# Reason codes that are likely transient network/DNS problems. After freeze+stop, the
+# status poller keeps probing ePDG and auto re-provisions once connectivity returns.
+# Permanent faults (SIM auth, not authorized, proposal, PIN, reg reject) stay sticky.
+NETWORK_RECOVERABLE = frozenset({
+    "epdg_unresolved", "tunnel_network", "tunnel_setup",
+})
+
+
+def _frozen(h, st, rmax, retrying_network: bool = False):
+    out = {"state": "ERROR", "label": status_mod.LABELS["ERROR"],
+           "reason_code": h["frozen_code"], "reason": h["frozen_reason"],
+           "detail": st.get("detail", {}), "retry": {"count": rmax, "max": rmax},
+           "frozen": True}
+    if retrying_network:
+        out["retrying_network"] = True
+    return out
+
+
+def _epdg_fqdn(inst: dict) -> str:
+    mcc, mnc = inst["mcc"], str(inst["mnc"]).zfill(3)
+    return inst.get("epdg") or f"epdg.epc.mnc{mnc}.mcc{mcc}.pub.3gppnetwork.org"
 
 
 def apply_health(iid, inst, st):
     """Overlay bounded auto-retry state. After max attempts of continuous failure (with the
-    SIM still present) the engine is stopped and the status frozen to ERROR + reason, until
-    the user retries/re-provisions or the card is re-inserted."""
+    SIM still present) the engine is stopped and the status frozen to ERROR + reason.
+
+    Permanent faults stay frozen until the user retries/re-provisions. Network-class
+    freezes (NETWORK_RECOVERABLE) additionally probe ePDG on each poll and auto
+    re-provision once DNS/connectivity returns. Manual Stop never sets frozen_code, so
+    it is never auto-restarted."""
     rcfg = inst.get("retry") or cfg.get_settings().get("retry", {})
     rmax = max(1, int(rcfg.get("max", 3)))
     rint = max(5, int(rcfg.get("interval", 40)))
+    # Default on: network-class freezes auto re-provision once ePDG resolves again.
+    auto_recover = bool(rcfg.get("auto_recover", True))
     h = hub.health_for(iid)
     state = st["state"]
 
@@ -424,7 +449,17 @@ def apply_health(iid, inst, st):
         st["retry"] = {"count": 0, "max": rmax}
         return st
     if h.get("frozen_code"):
-        return _frozen(h, st, rmax)
+        recoverable = h["frozen_code"] in NETWORK_RECOVERABLE
+        if (recoverable and auto_recover and not h.get("recovering")
+                and inst.get("enabled", True)):
+            now = time.monotonic()
+            last = h.get("last_recover_try")
+            due = last is None or (now - last) >= rint
+            if due and status_mod.resolve_epdg(_epdg_fqdn(inst)):
+                h["last_recover_try"] = now
+                h["recovering"] = True
+                asyncio.create_task(_auto_recover(str(iid)))
+        return _frozen(h, st, rmax, retrying_network=recoverable and auto_recover)
     if state == "STOPPED":
         st["retry"] = {"count": 0, "max": rmax}
         return st
@@ -441,7 +476,7 @@ def apply_health(iid, inst, st):
         return _frozen(h, st, rmax)
 
     # EPDG_UNRESOLVED / TUNNEL_DOWN / REGISTERING -> the engine keeps retrying internally;
-    # we bound the total time and then give up.
+    # we bound the total time and then give up (network-class freezes can auto-recover).
     now = time.monotonic()
     if h["fail_start"] is None:
         h["fail_start"] = now
@@ -451,14 +486,89 @@ def apply_health(iid, inst, st):
     if elapsed >= rmax * rint:
         h["frozen_code"] = st["reason_code"]
         h["frozen_reason"] = st["reason"]
+        # Seed the recover cooldown so we don't stop→restart in the same breath while the
+        # network is still down; the next eligible attempt is one retry.interval later.
+        if st["reason_code"] in NETWORK_RECOVERABLE:
+            h["last_recover_try"] = now
         try:
             engine.stop(iid)
         except Exception:
             pass
         asyncio.create_task(hub.drop_ami(str(iid)))
-        return _frozen(h, st, rmax)
+        return _frozen(h, st, rmax,
+                       retrying_network=(st["reason_code"] in NETWORK_RECOVERABLE
+                                        and auto_recover))
     st["retry"] = {"count": count, "max": rmax}
     return st
+
+
+async def _auto_recover(iid: str):
+    """Re-provision a line frozen for a recoverable network reason, once ePDG resolves.
+    Mirrors the Start / Re-provision path (PIN preflight, reader rebind, engine.start).
+    Permanent preflight failures upgrade the freeze so we stop hammering; transient
+    no_card leaves the network freeze in place for the next interval."""
+    h = hub.health_for(iid)
+    try:
+        inst = cfg.get_instance(iid)
+        if not inst or not inst.get("enabled", True):
+            return
+        if h.get("frozen_code") not in NETWORK_RECOVERABLE:
+            return
+
+        mism = _card_identity_mismatch(inst)
+        if mism:
+            h["frozen_code"] = "card_mismatch"
+            h["frozen_reason"] = (
+                f"The card in {mism['reader']} now has a different identity "
+                f"(ICCID {mism['iccid']}; this line expects {inst.get('iccid')}). "
+                "Provision the active profile as its own line, or switch back, then start."
+            )
+            log.warning("auto-recover aborted — card mismatch instance=%s", iid)
+            return
+
+        pf = await _preflight_pin(inst)
+        if not pf["ok"]:
+            code = pf.get("code") or "pin_required"
+            if code == "no_card":
+                log.info("auto-recover deferred — no card instance=%s", iid)
+                return
+            if pf.get("clear"):
+                cfg.clear_pin(str(iid))
+            h["frozen_code"] = code
+            h["frozen_reason"] = status_mod.REASONS.get(
+                code, "SIM PIN required or invalid — enter PIN and start again.")
+            log.warning("auto-recover aborted — %s instance=%s", code, iid)
+            return
+
+        updates: dict = {}
+        live_port = await asyncio.to_thread(_reader_port_for_instance, inst)
+        if live_port and live_port != inst.get("reader_port"):
+            log.info("auto-recover instance %s: reader port %s -> %s",
+                     iid, inst.get("reader_port"), live_port)
+            updates["reader_port"] = live_port
+            inst = {**inst, "reader_port": live_port}
+        live_idx = await asyncio.to_thread(_reader_index_for_instance, inst)
+        if live_idx is not None and live_idx != inst.get("reader_index"):
+            log.info("auto-recover instance %s: reader index %s -> %s",
+                     iid, inst.get("reader_index"), live_idx)
+            updates["reader_index"] = live_idx
+        if updates:
+            inst = cfg.upsert_instance({"id": str(iid), **updates})
+
+        hub._msisdn_tries.pop(str(iid), None)
+        # Keep frozen_code until start succeeds so a failed start leaves the network
+        # freeze in place for the next recover interval (and recovering blocks
+        # double-scheduling while start is in flight).
+        await hub.drop_ami(iid)
+        dev = os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1"
+        log.info("auto-recover re-provisioning instance=%s (network restored)", iid)
+        await asyncio.to_thread(engine.start, inst, cfg.get_settings(), dev_mounts=dev)
+        hub.reset_health(iid)
+        asyncio.create_task(push_status(str(iid)))
+    except Exception as e:  # noqa
+        log.warning("auto-recover failed instance=%s: %r", iid, e)
+    finally:
+        hub.health_for(iid)["recovering"] = False
 
 
 @asynccontextmanager

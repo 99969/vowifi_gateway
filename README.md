@@ -225,12 +225,54 @@ There is **no required carrier database** — every carrier-specific value is de
 
 Nothing to preseed or reload — insert the SIM and provision it.
 
+### P-Access-Network-Info (country / BSSID)
+
+IMS REGISTER and subsequent SIP requests carry a `P-Access-Network-Info` header so the
+carrier can see the Wi-Fi access context. The default matches real VoWiFi handsets:
+
+```text
+P-Access-Network-Info: IEEE-802.11;country=GB
+```
+
+`country` is the ISO 3166-1 alpha-2 code derived from the SIM's MCC (E.212 → ISO table in
+`control/app/mcc_country.py`). Configure per line in **SIM Config → P-Access-Network-Info**:
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| Report country code | on | Append `country=XX`. Leave the text box empty to derive XX from the SIM MCC; type e.g. `GB` to pin it. |
+| Report Wi-Fi AP BSSID | off | Append `i-wlan-node-id=<12 hex>` (TS 24.229 WLAN AP MAC). Off by default — real phones often omit a forged BSSID. |
+| Access type | `IEEE-802.11` | PANI access-type token (`IEEE-802.11*`, or `3GPP-WLAN`). |
+
+Advanced (config.yaml / API only, not in the UI):
+
+- `sip.pani` — raw header override; if non-empty, all of the knobs above are ignored.
+- `sip.pani_local_time_zone` — optional `local-time-zone=…` (24.229 says the UE should not insert this; leave unset unless a carrier demands it).
+
+**Migration note:** older builds sent `IEEE-802.11;i-wlan-node-id=ffffffffffff` (no country,
+forged BSSID). After upgrade, the next line restart / save emits `IEEE-802.11;country=<home>`.
+If a carrier regresses, turn on **Report Wi-Fi AP BSSID** (optionally with a real AP MAC) or set
+`sip.pani` to the exact legacy string.
+
 ---
 
 ## Troubleshooting
 
 **Engine stuck at `EPDG_UNRESOLVED` or `TUNNEL_DOWN`:**  
 Check the ePDG FQDN resolves + is reachable on UDP 500/4500. Some carriers restrict ePDG access by geo/IP; a VPN exit in the carrier's home country can help.
+
+**Repeated `AUTHENTICATION_FAILED (24)` right after a reconnect, but a fresh start works:**  
+The ePDG rejected the EAP-AKA *fast re-authentication identity* (RFC 4187 `AT_NEXT_REAUTH_ID`) that
+the AAA issued on the previous attach and has since expired — the IKE_AUTH reply carries only the
+Notify, with no EAP challenge, so the SIM is never queried. swu_ike detects this, drops the stale
+identity and retries immediately with the permanent IMSI NAI (look for `the AAA has expired it` in
+the engine log); it does not offer another fast re-auth identity for the rest of that run. For a
+carrier where this happens on every reconnect, skip the wasted round trip by unticking **Use EAP-AKA
+fast re-authentication** in **SIM Config** (stored as `use_reauth_id: false` on the line, passed to
+the engine as `SWU_USE_REAUTH_ID=0`).
+
+Note this is distinct from a genuine `AUTHENTICATION_FAILED` on the permanent NAI, which the WebUI
+reports as *not provisioned for Wi-Fi Calling* — the fallback path deliberately avoids that wording
+so the two are not confused.
 
 **`PIN_PROBLEM`:**  
 Wrong PIN, or the SIM locked (PUK needed). Re-provision with the correct PIN; if the SIM is locked, unlock it first (SIM manager tool outside this gateway).

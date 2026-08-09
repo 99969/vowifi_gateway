@@ -16,6 +16,8 @@ from copy import deepcopy
 
 import yaml
 
+from .mcc_country import mcc_to_iso2
+
 DATA_DIR = os.environ.get("VOWIFI_DATA", os.path.join(os.getcwd(), "data"))
 CONFIG_PATH = os.path.join(DATA_DIR, "config.yaml")
 _lock = threading.RLock()
@@ -27,7 +29,10 @@ DEFAULTS = {
         "tls": {"self_signed": True, "domain": "", "cert_path": "", "key_path": ""},
         "debug": {"asterisk": True, "charon": False, "pcap": False},
         "manager_url": "",          # reachable URL engines POST events to (auto if empty)
-        "retry": {"max": 3, "interval": 30},   # auto-retry attempts + seconds per attempt
+        # auto_recover: after a network-class freeze (ePDG/DNS/tunnel timeout), probe
+        # connectivity and auto re-provision when the network returns. Off = sticky ERROR
+        # until the user presses Start / Re-provision.
+        "retry": {"max": 3, "interval": 30, "auto_recover": True},
         # Proactive IKEv2 SA rekey. IKEv2 does NOT negotiate SA lifetime on the wire (RFC 7296
         # dropped it), so rekey timing is local policy (3GPP TS 24.302 clause 7.2.2C: use a
         # configured value, else an implementation value). We rekey the CHILD (ESP) SA every
@@ -438,6 +443,95 @@ def normalize_cp_mode(mode: str) -> str:
     return m if m in ("auto", "v6", "v4", "dual") else "auto"
 
 
+# TS 24.229 clause 7.2A.4.3 access-type values used for WLAN/VoWiFi, plus 3GPP-WLAN which
+# appears in osmocom/sysmocom reference configs (historical / carrier-specific).
+PANI_ACCESS_TYPES = frozenset({
+    "IEEE-802.11", "IEEE-802.11a", "IEEE-802.11b", "IEEE-802.11g", "IEEE-802.11n",
+    "IEEE-802.11ac", "IEEE-802.11ax", "IEEE-802.11be", "IEEE-802.11j", "IEEE-802.11p",
+    "IEEE-802.11y", "IEEE-802.11ad", "IEEE-802.11af", "IEEE-802.11ah", "IEEE-802.11aj",
+    "IEEE-802.11ay", "IEEE-802.11bd", "3GPP-WLAN",
+})
+
+
+def normalize_pani_country(c) -> str:
+    """ISO 3166-1 alpha-2 country code for PANI country=. Strip + upper-case; invalid -> ''."""
+    s = "".join(ch for ch in str(c or "").strip().upper() if ch.isalpha())
+    return s if len(s) == 2 else ""
+
+
+def normalize_pani_node_id(m) -> str:
+    """WLAN BSSID / AP MAC for i-wlan-node-id: strip : - . spaces, lower-case hex, 12 digits."""
+    s = "".join(ch for ch in str(m or "") if ch.isalnum()).lower()
+    if len(s) == 12 and all(ch in "0123456789abcdef" for ch in s):
+        return s
+    return ""
+
+
+def normalize_pani_access_type(t) -> str:
+    """PANI access-type; unknown values fall back to IEEE-802.11."""
+    s = (t or "").strip()
+    return s if s in PANI_ACCESS_TYPES else "IEEE-802.11"
+
+
+def _sip_bool(sip: dict, key: str, default: bool) -> bool:
+    """Read a sip.* bool that may be absent (legacy configs) or explicitly False."""
+    if key not in sip:
+        return default
+    v = sip.get(key)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
+def build_pani(inst: dict, sip: dict | None = None) -> str:
+    """Compose the unescaped P-Access-Network-Info value for the engine.
+
+    Resolution (industry VoWiFi convention; see RFC 7315 extension-access-info + TS 24.229
+    i-wlan-node-id coding rules):
+      1. sip.pani non-empty → raw override (caller owns the exact header value).
+      2. Else access-type (default IEEE-802.11).
+      3. If pani_country_enable (default True): country=XX from explicit pani_country, else
+         MCC→ISO via mcc_to_iso2(inst.mcc).
+      4. If pani_node_id_enable (default False): append i-wlan-node-id=<12 hex>.
+      5. Optional pani_local_time_zone (config-only; 24.229 says UE should not insert it).
+
+    Returns a clean value (no Asterisk \\; escaping) — engine/render.py escapes for pjsip.conf.
+    Default shape matches a working UE trace: ``IEEE-802.11;country=GB``.
+    """
+    sip = sip if sip is not None else (inst.get("sip") or {})
+    raw = (sip.get("pani") or "").strip()
+    if raw:
+        return raw
+
+    parts = [normalize_pani_access_type(sip.get("pani_access_type"))]
+
+    if _sip_bool(sip, "pani_country_enable", True):
+        country = normalize_pani_country(sip.get("pani_country"))
+        if not country:
+            country = mcc_to_iso2(inst.get("mcc"))
+        if country:
+            parts.append(f"country={country}")
+
+    if _sip_bool(sip, "pani_node_id_enable", False):
+        node = normalize_pani_node_id(sip.get("pani_node_id"))
+        if node:
+            parts.append(f"i-wlan-node-id={node}")
+
+    tz = (sip.get("pani_local_time_zone") or "").strip()
+    if tz:
+        # Quote if the value contains spaces / special chars and isn't already quoted.
+        if " " in tz or ";" in tz:
+            if not (tz.startswith('"') and tz.endswith('"')):
+                tz = '"' + tz.replace('"', '') + '"'
+        parts.append(f"local-time-zone={tz}")
+
+    return ";".join(parts)
+
+
 # Carrier CP-mode preference database, keyed by "mcc-mnc" (MNC as stored on the line — may be 2- or
 # 3-digit; render_instance_json tries both). Value = the family a real UE uses on that network, used
 # as the FIRST rung of the auto discovery ladder (a starting hint, NOT a hard override — the ladder
@@ -533,7 +627,17 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
             "ring_timeout": max(5, min(180, int(
                 sip.get("ring_timeout") or settings.get("ring_timeout", 35)))),
             "user_agent": sip.get("user_agent", "iOS/26.6 iPhone"),
-            "pani": sip.get("pani", ""),
+            # P-Access-Network-Info: composed from sip.pani_* options (or raw sip.pani override).
+            # Default = IEEE-802.11;country=<SIM MCC country> — matches real VoWiFi UEs.
+            "pani": build_pani(inst, sip),
+            # Pass structured knobs through so a hand-re-rendered engine can rebuild without
+            # re-running control (engine/render.py has a lightweight fallback).
+            "pani_country_enable": _sip_bool(sip, "pani_country_enable", True),
+            "pani_country": normalize_pani_country(sip.get("pani_country")),
+            "pani_node_id_enable": _sip_bool(sip, "pani_node_id_enable", False),
+            "pani_node_id": normalize_pani_node_id(sip.get("pani_node_id")),
+            "pani_access_type": normalize_pani_access_type(sip.get("pani_access_type")),
+            "pani_local_time_zone": (sip.get("pani_local_time_zone") or "").strip(),
             "webrtc": {
                 "enable": bool(webrtc.get("enable", True)),
                 "username": webrtc.get("username", "webrtc"),
@@ -559,6 +663,11 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         # See swu_ike.py (SWU_CP_MODE / SWU_CP_MODE_ORDER).
         "cp_mode": normalize_cp_mode(inst.get("cp_mode", "")),
         "cp_mode_order": cp_mode_order_for(inst["mcc"], inst["mnc"]),
+        # EAP-AKA fast re-authentication (RFC 4187 AT_NEXT_REAUTH_ID). Default True: present the
+        # AAA-issued re-auth identity as the IKEv2 IDi on a reconnect, with an automatic fallback
+        # to the permanent NAI when the ePDG rejects it. Set False per line for a carrier whose
+        # AAA reliably expires them (O2 UK), to skip the wasted attach round trip.
+        "use_reauth_id": bool(inst.get("use_reauth_id", True)),
     }
 
 

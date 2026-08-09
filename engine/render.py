@@ -12,11 +12,62 @@ Env overrides (used by entrypoint / keeper / ami_usim after render): USIM_PIN, U
 import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 
 from jinja2 import Environment, FileSystemLoader
+
+
+def escape_pani_for_asterisk(value: str) -> str:
+    """Escape bare ';' as '\\;' for Asterisk .conf ('; starts a comment). Idempotent:
+    already-escaped '\\;' sequences are left alone."""
+    if not value:
+        return value
+    return re.sub(r"(?<!\\);", r"\\;", value)
+
+
+def compose_pani_from_sip(sip: dict) -> str:
+    """Lightweight PANI builder for hand-authored instance.json (no MCC table).
+
+    Managed instances already receive a fully composed ``sip.pani`` from the control
+    plane. This path only runs when pani is empty and the structured knobs are set.
+    """
+    sip = sip or {}
+    raw = (sip.get("pani") or "").strip()
+    if raw:
+        return raw
+
+    access = (sip.get("pani_access_type") or "IEEE-802.11").strip() or "IEEE-802.11"
+    parts = [access]
+
+    country_on = sip.get("pani_country_enable", True)
+    if isinstance(country_on, str):
+        country_on = country_on.strip().lower() in ("1", "true", "yes", "on")
+    if country_on is None:
+        country_on = True
+    if country_on:
+        country = "".join(ch for ch in str(sip.get("pani_country") or "").strip().upper()
+                          if ch.isalpha())
+        if len(country) == 2:
+            parts.append(f"country={country}")
+
+    node_on = sip.get("pani_node_id_enable", False)
+    if isinstance(node_on, str):
+        node_on = node_on.strip().lower() in ("1", "true", "yes", "on")
+    if node_on:
+        node = "".join(ch for ch in str(sip.get("pani_node_id") or "") if ch.isalnum()).lower()
+        if len(node) == 12 and all(ch in "0123456789abcdef" for ch in node):
+            parts.append(f"i-wlan-node-id={node}")
+
+    tz = (sip.get("pani_local_time_zone") or "").strip()
+    if tz:
+        if (" " in tz or ";" in tz) and not (tz.startswith('"') and tz.endswith('"')):
+            tz = '"' + tz.replace('"', "") + '"'
+        parts.append(f"local-time-zone={tz}")
+
+    return ";".join(parts)
 
 TPL_DIR = os.environ.get("VOWIFI_TPL", "/opt/vowifi/templates")
 CFG_PATH = os.environ.get("VOWIFI_INSTANCE", "/config/instance.json")
@@ -148,9 +199,13 @@ def build_context(cfg):
         "local_addr": cfg.get("local_addr") or container_ipv4(),
         "ike_proposals": ike.get("proposals", default_ike),
         "esp_proposals": ike.get("esp_proposals", default_esp),
-        # P-Access-Network-Info: i-wlan-node-id should be the Wi-Fi AP BSSID (MAC). The
-        # carrier P-CSCF augments this; a bogus value can make some SMSCs reject MO SMS.
-        "pani": (sip.get("pani") or r"IEEE-802.11\;i-wlan-node-id=ffffffffffff"),
+        # P-Access-Network-Info. Control plane composes the clean value (typically
+        # IEEE-802.11;country=GB from the SIM MCC). Hand-authored instance.json may leave
+        # pani empty and set pani_country / pani_node_id instead — compose_pani_from_sip
+        # handles that. Bare IEEE-802.11 is the last-resort default (no forged BSSID;
+        # a bogus i-wlan-node-id=ffffffffffff can make some SMSCs reject MO SMS).
+        # Escape ';' as '\\;' for Asterisk .conf at the last moment (idempotent).
+        "pani": escape_pani_for_asterisk(compose_pani_from_sip(sip) or "IEEE-802.11"),
         # Present as a real phone, not "Asterisk", to the carrier (User-Agent + Server).
         "user_agent": (sip.get("user_agent") or "iOS/26.6 iPhone"),
         # SDP identity (s=/o= lines) — Asterisk defaults s=Asterisk which fingerprints it.
@@ -270,6 +325,11 @@ def main():
         # before it silently ages out (3GPP TS 24.302 7.2.2C). Set by the manager from
         # settings.rekey.minutes (default 30); hand-authored configs may omit it.
         f.write(f"SWU_CHILD_REKEY_MINUTES={cfg.get('rekey_minutes', 30)}\n")
+        # EAP-AKA fast re-authentication (RFC 4187 AT_NEXT_REAUTH_ID). '1' (default) presents the
+        # AAA-issued re-auth identity as IDi on a reconnect; swu_ike falls back to the permanent
+        # NAI automatically if the ePDG rejects it. '0' never offers one — for a carrier (O2 UK
+        # observed) whose AAA reliably expires them, this skips the wasted round trip.
+        f.write(f"SWU_USE_REAUTH_ID={1 if cfg.get('use_reauth_id', True) else 0}\n")
     print(f"[render] env -> {env_path}")
 
 
