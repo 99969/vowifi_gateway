@@ -58,6 +58,8 @@ export default function Settings() {
         <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 10 }}>
           If the VoWiFi tunnel or IMS registration drops while the SIM is still present, the line
           auto-retries. After the retry budget is exhausted it stops and shows the failure reason.
+          With network auto-recover enabled, a network/DNS freeze will re-provision the line once
+          connectivity returns (SIM-auth and other permanent faults still stay stopped).
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
           <div><label>Max retries</label><input type="number" min="1" value={s.retry?.max ?? 3}
@@ -65,6 +67,12 @@ export default function Settings() {
           <div><label>Seconds per attempt</label><input type="number" min="5" value={s.retry?.interval ?? 40}
             onChange={(e) => upd({ retry: { ...(s.retry || {}), interval: +e.target.value } })} /></div>
         </div>
+        <label style={{ marginTop: 12, display: 'block' }}>
+          <input type="checkbox" style={{ width: 'auto', marginRight: 8 }}
+            checked={s.retry?.auto_recover !== false}
+            onChange={(e) => upd({ retry: { ...(s.retry || {}), auto_recover: e.target.checked } })} />
+          Auto re-provision when network recovers
+        </label>
       </div>
 
       <div className="card" style={{ padding: 20 }}>

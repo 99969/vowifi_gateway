@@ -775,7 +775,17 @@ class swu():
         self.old_ike_message_received = False        
         self.ike_spi_initiator_old = None
         self.ike_spi_responder_old = None
+        # EAP-AKA fast re-authentication identity (RFC 4187 clause 4.1.1.2 / AT_NEXT_REAUTH_ID).
+        # When the AAA hands one out we present it as the IKEv2 IDi on the NEXT attach instead of
+        # the permanent IMSI NAI, which lets the network skip a full AKA run. It is single-use and
+        # the AAA may expire or forget it at any time — some networks (O2 UK observed) then reject
+        # IKE_AUTH with AUTHENTICATION_FAILED before sending any EAP challenge. _reauth_id_rejected
+        # records that so this process stops presenting fast re-auth identities and falls back to
+        # the permanent NAI. SWU_USE_REAUTH_ID=0 opts out entirely for such a carrier.
         self.next_reauth_id = None
+        self.use_reauth_id = os.environ.get("SWU_USE_REAUTH_ID", "1").strip().lower() \
+            not in ("0", "no", "false", "off")
+        self._reauth_id_rejected = False
         
         self.check_nat = True
         self.device_identity_requested = False
@@ -863,7 +873,7 @@ class swu():
         self._esp_liveness_last_tx = 0.0
         self._esp_liveness_min_interval = float(os.environ.get("SWU_ESP_LIVENESS_INTERVAL", "5") or 5)
 
-        self.set_identification(IDI,ID_RFC822_ADDR,'0' + self.imsi + '@nai.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
+        self.set_identification(IDI,ID_RFC822_ADDR,self.permanent_nai())
         # IDr (the identity of the ePDG we want to reach) is, per 3GPP TS 24.302 clause 7.2.2.1,
         # the APN encoded as an ID_FQDN. Two encodings are seen in the wild:
         #   "apn"  -> the bare APN (e.g. "ims"). This is the default and stays the default because
@@ -1290,10 +1300,52 @@ class swu():
         print('DIFFIE-HELLMAN KEY',toHex(self.dh_shared_key))
         
         
+    def permanent_nai(self):
+        """The permanent IMSI-derived root NAI used as the IKEv2 IDi (3GPP TS 23.003 clause 19.3.2):
+        0<IMSI>@nai.epc.mnc<MNC3>.mcc<MCC3>.3gppnetwork.org. Always valid — unlike the EAP-AKA fast
+        re-authentication identity, which the AAA can expire at any time."""
+        return '0' + self.imsi + '@nai.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org'
+
+    def reauth_identity(self):
+        """The fast re-authentication identity to present as IDi on the next attach, or None to use
+        the permanent NAI. Returns None once this carrier has rejected one (or when opted out via
+        SWU_USE_REAUTH_ID=0), so a doomed identity is never presented twice in the same process."""
+        if not self.use_reauth_id or self._reauth_id_rejected:
+            return None
+        return self.next_reauth_id
+
+    def using_reauth_identity(self):
+        """True if the IDi we just presented was a fast re-authentication identity rather than the
+        permanent NAI. Used to tell an expired-pseudonym reject apart from a real subscription
+        problem when the ePDG answers IKE_AUTH with AUTHENTICATION_FAILED."""
+        idi = self.identification_initiator[1] if self.identification_initiator else None
+        return bool(idi) and idi != self.permanent_nai()
+
+    def _fall_back_to_permanent_nai(self):
+        """The ePDG rejected IKE_AUTH while we were presenting a fast re-authentication identity.
+        That is an expired/forgotten pseudonym at the AAA, NOT a subscription or geo block: drop the
+        identity, switch IDi back to the permanent NAI and grant one extra attach attempt so the
+        retry happens immediately instead of costing a supervised restart (~tunnel downtime).
+        Deliberately avoids the 'before any EAP-AKA challenge' / 'not provisioned for VoWiFi'
+        wording — control/app/status.classify_ike matches those to report the line as
+        not-authorized, which would be a wrong diagnosis here."""
+        stale = self.next_reauth_id
+        self._reauth_id_rejected = True
+        self.next_reauth_id = None
+        self.set_identification(IDI, ID_RFC822_ADDR, self.permanent_nai())
+        self.iterations = getattr(self, "iterations", 0) + 1
+        swu_log("IKE_AUTH rejected (AUTHENTICATION_FAILED) while presenting the EAP-AKA fast "
+                "re-authentication identity %r — the AAA has expired it. Retrying with the "
+                "permanent NAI %s and not offering a fast re-auth identity again this run."
+                % (stale, self.permanent_nai()))
+        self.reject_reason_code = "AUTHENTICATION_FAILED"
+        self.reject_reason_policy = "transient"
+        return OTHER_ERROR, 'REAUTH IDENTITY EXPIRED'
+
     def get_identity(self):
             imsi = return_imsi(self.com_port)
             self.imsi = imsi
-            self.set_identification(IDI,ID_RFC822_ADDR,'0' + self.imsi + '@nai.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
+            self.set_identification(IDI,ID_RFC822_ADDR,self.permanent_nai())
     
     def encode_eap_at_identity(self, identity):
         """ Returns the EAP AT Identity as bytes """
@@ -4055,6 +4107,10 @@ class swu():
 
                     elif i[1][1]<16384: #error
                         code = i[1][1]
+                        if code == AUTHENTICATION_FAILED and self.using_reauth_identity():
+                            # Expired EAP-AKA fast re-authentication identity, not a subscription
+                            # problem: drop it and retry immediately with the permanent NAI.
+                            return self._fall_back_to_permanent_nai()
                         if code == AUTHENTICATION_FAILED:
                             # The ePDG rejected our identity at IKE_AUTH *before* sending any
                             # EAP-AKA challenge — the SIM was never queried. This is an AAA/HSS
@@ -4213,13 +4269,11 @@ class swu():
                       
                             if i[1][4][0][0] in (AT_ANY_ID_REQ, AT_IDENTITY):
                                 self.eap_identifier = i[1][1]
-                                identity = (
-                                        '0'
-                                        + self.imsi
-                                        + '@nai.epc.mnc' + self.mnc
-                                        + '.mcc' + self.mcc
-                                        + '.3gppnetwork.org'
-                                )
+                                # Answer an EAP identity request with the permanent NAI. RFC 4187
+                                # clause 4.1.2 lets AT_ANY_ID_REQ be answered with a pseudonym or a
+                                # fast re-auth identity, but the permanent one is always accepted —
+                                # and is what lets a stale-pseudonym attach recover here too.
+                                identity = self.permanent_nai()
                                 self.eap_payload_response = (
                                         bytes([2])
                                         + bytes([self.eap_identifier])
@@ -4967,10 +5021,8 @@ class swu():
                         self.state_ue_create_sa_child()
                     elif msg =="r\n": # restart process
                         self.state_delete(True,False)
-                        if self.next_reauth_id is not None:
-                            self.set_identification(IDI,ID_RFC822_ADDR,self.next_reauth_id)
-                        else:
-                            self.set_identification(IDI,ID_RFC822_ADDR,'0' + self.imsi + '@nai.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
+                        self.set_identification(IDI, ID_RFC822_ADDR,
+                                                self.reauth_identity() or self.permanent_nai())
 
                         self.iterations = 2
                         return

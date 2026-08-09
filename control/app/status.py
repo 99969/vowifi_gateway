@@ -2,7 +2,8 @@
 status.py - Per-instance status state machine with failure classification.
 
 Returns a live snapshot: {state, label, reason_code, reason, detail}. The manager's
-health tracker (main.py) overlays retry counters and, on exhaustion, an ERROR state.
+health tracker (main.py) overlays retry counters and, on exhaustion, an ERROR state
+(network-class freezes auto re-provision once ePDG resolves again).
 
 States:      STOPPED, NO_CARD, PIN_PROBLEM, EPDG_UNRESOLVED, TUNNEL_DOWN, REGISTERING, OK
 reason_code: machine key for the WebUI; `reason` is a user-friendly sentence.
