@@ -971,6 +971,13 @@ async def api_provision(body: dict):
         raise HTTPException(400, "could not read IMSI (is the PIN correct?)")
     sip = body.get("sip") or {"listen_addr": "0.0.0.0", "transport": "udp", "external": []}
     sip.setdefault("webrtc", {"enable": bool(body.get("webrtc", True))})
+    try:
+        cfg.validate_sip_external_usernames(sip)
+    except ValueError as e:
+        raise HTTPException(
+            400,
+            detail={"code": "duplicate_sip_username", "message": str(e)},
+        ) from e
     # SMSC: manual override wins; otherwise read from the SIM (EF_SMSP, authoritative).
     # If the SIM can't provide it we ask the user to type it (no carrier presets).
     smsc = (body.get("smsc") or "").strip() or c.smsc
@@ -1023,7 +1030,18 @@ async def api_provision(body: dict):
             inst["ports"] = cfg.alloc_ports_auto(cfg.load(), exclude_iid=iid)
         except ValueError as e:
             raise HTTPException(422, f"port_error: {e}")
-    inst = cfg.upsert_instance(inst)
+    try:
+        inst = cfg.upsert_instance(inst)
+    except ValueError as e:
+        message = str(e)
+        code = (
+            "duplicate_sip_username"
+            if "more than once" in message or "reserved" in message
+            else "invalid_sip_account"
+        )
+        raise HTTPException(
+            400, detail={"code": code, "message": message}
+        ) from e
     hub._msisdn_tries.pop(str(inst["id"]), None)
     hub.reset_health(inst["id"])
     # engine.start force-removes any existing container; retire AMI first so a cached
@@ -1040,12 +1058,18 @@ async def api_provision(body: dict):
 # ----------------------------- settings -----------------------------
 @app.get("/api/settings")
 def api_get_settings():
-    return cfg.get_settings()
+    return cfg.public_settings()
 
 
 @app.put("/api/settings")
 def api_put_settings(body: dict):
-    return cfg.update_settings(body)
+    try:
+        return cfg.update_settings(body)
+    except ValueError as e:
+        raise HTTPException(
+            400,
+            detail={"code": "invalid_settings", "message": str(e)},
+        ) from e
 
 
 # ----------------------------- instances -----------------------------
@@ -1070,34 +1094,44 @@ async def api_instances():
         live_port = _reader_port_for_instance(inst)
         if live_port:
             safe["reader_port"] = live_port
+        # YAML can load numeric-looking ids as ints while WebSocket events use strings.
+        safe["id"] = str(inst["id"])
         out.append({**safe, "status": st})
     return {"instances": out}
 
 
 @app.post("/api/instances")
 async def api_instance_upsert(body: dict):
+    """Persist configuration without implicitly recreating a healthy running engine."""
     if "id" not in body:
         raise HTTPException(400, "id required")
     iid = str(body["id"])
-    was_running = await asyncio.to_thread(engine.is_running, iid)
-    inst = cfg.upsert_instance(body)
-    applied = False
-    # A running line holds its config in the engine container (rendered instance.json:
-    # pjsip accounts, IMEI, SMSC, User-Agent, …). Editing the config alone doesn't reach
-    # the running Asterisk — so restart the container to re-render + reload the new config.
-    if was_running:
+    if "sip" in body:
         try:
-            hub._msisdn_tries.pop(iid, None)
-            hub.reset_health(iid)
-            await hub.drop_ami(iid)
-            await asyncio.to_thread(engine.start, inst, cfg.get_settings(),
-                                    dev_mounts=os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1")
-            applied = True
-            asyncio.create_task(push_status(iid))
-        except Exception as e:  # noqa
-            log.warning("apply-on-save restart failed for %s: %r", iid, e)
+            cfg.validate_sip_external_usernames(body.get("sip"))
+        except ValueError as e:
+            raise HTTPException(
+                400,
+                detail={"code": "duplicate_sip_username", "message": str(e)},
+            ) from e
+    was_running = await asyncio.to_thread(engine.is_running, iid)
+    try:
+        inst = cfg.upsert_instance(body)
+    except ValueError as e:
+        message = str(e)
+        code = (
+            "duplicate_sip_username"
+            if "more than once" in message or "reserved" in message
+            else "invalid_sip_account"
+        )
+        raise HTTPException(
+            400, detail={"code": code, "message": message}
+        ) from e
     safe = {k: v for k, v in inst.items() if k != "pin"}
-    safe["applied"] = applied      # true => config was re-applied to the running engine
+    # The live container keeps its already-rendered pjsip/IMEI/SMSC settings until an
+    # explicit Stop -> Start (or re-provision), avoiding an unexpected IMS interruption.
+    safe["restart_required"] = bool(was_running)
+    safe["applied"] = False  # compatibility with older WebUI clients
     return safe
 
 

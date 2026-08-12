@@ -97,12 +97,30 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # Best-effort primary LAN IPv4 of THIS host (the address SIP/WebRTC clients must reach).
 detect_lan_ip() {
+  # Prefer a real LAN NIC over the default-route source. With a full-tunnel VPN the
+  # latter is commonly a private tunnel address that LAN SIP clients cannot reach.
   ip=""
   if have ip; then
-    ip=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
+    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '
+      $2 ~ /^(docker|br-|veth|virbr|cni|flannel|tun|tap|wg|ipsec|vti|uk-|nordlynx|tailscale|zerotier|zt|ppp)/ { next }
+      $2 == "lo" { next }
+      {
+        split($4, a, "/")
+        addr = a[1]
+        if (addr ~ /^127\./ || addr ~ /^169\.254\./ || addr ~ /^172\.17\./) next
+        print addr
+        exit
+      }')
   fi
   if [ -z "$ip" ] && have hostname; then
-    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -v '^127\.' | head -n1)
+    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^192\.168\.' | head -n1)
+  fi
+  if [ -z "$ip" ] && have hostname; then
+    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' \
+      | grep -Ev '^(127\.|169\.254\.|172\.17\.)' | head -n1)
+  fi
+  if [ -z "$ip" ] && have ip; then
+    ip=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
   fi
   printf '%s' "$ip"
 }

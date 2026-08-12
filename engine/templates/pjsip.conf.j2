@@ -100,9 +100,10 @@ transport=volte_ims
 {# The engine runs in a docker bridge container; its private IP (e.g. 172.17.0.2) is NOT
    routable from a LAN SIP client. Without an external address Asterisk advertises that
    private IP in its Contact + SDP, so a remote MicroSIP sends in-dialog requests (BYE!) to
-   an unroutable target and the call never tears down. Advertise the host's reachable address
-   (domain wins if set, else the manager-supplied advertise_addr = host LAN IP). #}
-{% set local_ext = domain or advertise_addr %}
+   an unroutable target and the call never tears down. advertise_addr is already resolved by
+   control with env/Settings/TLS/auto precedence; use the TLS domain only as a fallback for
+   hand-authored engine configs that omit it. #}
+{% set local_ext = advertise_addr or domain %}
 {% if sip_transport == 'tls' %}
 [transport-local]
 type=transport
@@ -156,10 +157,12 @@ message_context=msg-from-local
 ; shows no incoming-call (Answer/Decline) overlay. The IMS realm is always a valid FQDN.
 from_domain={{ realm }}
 disallow=all
-allow=amr
+; Prefer narrowband PCM on the local leg. It negotiates telephone-event/8000 reliably
+; with Linphone/MicroSIP; Asterisk can still transcode to AMR on the IMS leg.
 allow=ulaw
 allow=alaw
 allow=opus
+allow=amr
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
@@ -169,6 +172,9 @@ rewrite_contact=yes
 ; left on (the default) Asterisk would try to re-INVITE the two ends to talk directly, which
 ; can't work → no audio. (volte_ims already has direct_media=no.)
 direct_media=no
+; Accept RFC4733 when offered and SIP INFO when telephone-event was not negotiated.
+; Keep the IMS endpoint on its default RFC4733 mode; this applies only to local clients.
+dtmf_mode=auto_info
 {% if msisdn %}
 callerid=undefined <{{ msisdn }}>
 {% endif %}
@@ -183,13 +189,17 @@ max_contacts=3
 remove_existing=yes
 
 {% for acct in external_accounts %}
+{% if acct.username %}
 [{{ acct.username }}](endpoint-local)
+; Pin third-party accounts to the UDP/TCP/TLS transport. They must not compete with WSS.
+transport=transport-local
 auth=auth-{{ acct.username }}
 aors={{ acct.username }}
 [auth-{{ acct.username }}](auth-local)
 username={{ acct.username }}
 password={{ acct.password }}
 [{{ acct.username }}](aor-local)
+{% endif %}
 {% endfor %}
 
 {% if webrtc_enable %}
