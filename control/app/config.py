@@ -11,6 +11,7 @@ import json
 import os
 import secrets
 import socket
+import subprocess
 import threading
 from copy import deepcopy
 
@@ -29,6 +30,9 @@ DEFAULTS = {
         "tls": {"self_signed": True, "domain": "", "cert_path": "", "key_path": ""},
         "debug": {"asterisk": True, "charon": False, "pcap": False},
         "manager_url": "",          # reachable URL engines POST events to (auto if empty)
+        # Host IP/hostname advertised to LOCAL SIP/WebRTC clients (Contact + SDP).
+        # Empty = auto-detect a LAN NIC (skipping common VPN/docker interfaces).
+        "advertise_address": "",
         # auto_recover: after a network-class freeze (ePDG/DNS/tunnel timeout), probe
         # connectivity and auto re-provision when the network returns. Off = sticky ERROR
         # until the user presses Start / Re-provision.
@@ -79,21 +83,83 @@ PORT_STRIDE = {"sip_udp": 10, "sip_tls": 10, "webrtc": 10, "ami": 10,
                "rtp_start": 2000, "rtp_end": 2000}
 
 
+def _iface_is_lan_candidate(name: str) -> bool:
+    """True when an interface is likely a host LAN NIC, not a VPN/container tunnel."""
+    n = (name or "").lower()
+    if not n or n == "lo":
+        return False
+    skip_prefixes = (
+        "docker", "br-", "veth", "virbr", "cni", "flannel", "tun", "tap",
+        "wg", "ipsec", "vti", "gre", "gretap", "erspan", "sit", "nlmon",
+        "uk-", "nordlynx", "tailscale", "zerotier", "zt", "ppp",
+    )
+    return not any(n.startswith(prefix) or n == prefix.rstrip("-")
+                   for prefix in skip_prefixes)
+
+
 def _host_lan_ipv4() -> str:
     """Best-effort primary LAN IPv4 of the host the manager runs on. Used as the address
     Asterisk advertises to LOCAL SIP clients (Contact + SDP), so a LAN MicroSIP can route
     in-dialog requests (BYE) back to the published host port instead of the unroutable
-    docker-bridge container IP. Uses a UDP connect (no traffic sent) to learn the source
-    address the kernel would pick for outbound; returns "" if it can't be determined."""
+    docker-bridge container IP.
+
+    Prefer an address assigned to a real LAN NIC. A UDP route probe alone is not enough on
+    a multi-homed host because a full-tunnel VPN can make its private tunnel address the
+    source selected for 1.1.1.1; advertising that address breaks LAN RTP/RFC4733 DTMF.
+    """
+    # Linux fast path: inspect interface IPv4 addresses while excluding common container,
+    # VPN and tunnel interface names. Prefer conventional Ethernet/Wi-Fi names.
+    try:
+        import fcntl
+        import struct
+
+        names = [n for n in os.listdir("/sys/class/net") if _iface_is_lan_candidate(n)]
+        names.sort(key=lambda n: (not n.lower().startswith(("en", "eth", "wl")), n))
+        for name in names:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    ifreq = struct.pack("256s", name[:15].encode())
+                    ip = socket.inet_ntoa(
+                        fcntl.ioctl(s.fileno(), 0x8915, ifreq)[20:24]  # SIOCGIFADDR
+                    )
+                finally:
+                    s.close()
+                if ip and not ip.startswith("127.") and not ip.startswith("169.254.") \
+                        and not ip.startswith("172.17."):
+                    return ip
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Fallbacks for non-Linux/minimal hosts. Keep the route-selected source, but prefer a
+    # 192.168/16 address from hostname -I when the route source looks like a VPN 10/8 IP.
+    route_ip = ""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("1.1.1.1", 80))
-        ip = s.getsockname()[0]
-        return ip if ip and not ip.startswith("127.") else ""
+        route_ip = s.getsockname()[0] or ""
     except Exception:
-        return ""
+        route_ip = ""
     finally:
         s.close()
+
+    extras: list[str] = []
+    try:
+        out = subprocess.check_output(
+            ["hostname", "-I"], text=True, stderr=subprocess.DEVNULL
+        )
+        extras = [p for p in out.split()
+                  if ":" not in p and not p.startswith(("127.", "169.254.", "172.17."))]
+    except Exception:
+        pass
+    preferred = [ip for ip in extras if ip.startswith("192.168.")]
+    if preferred and (not route_ip or route_ip.startswith("10.")):
+        return preferred[0]
+    if route_ip and not route_ip.startswith(("127.", "169.254.", "172.17.")):
+        return route_ip
+    return extras[0] if extras else ""
 
 
 def ims_realm(mcc: str, mnc: str) -> str:
@@ -104,18 +170,40 @@ def ims_realm(mcc: str, mnc: str) -> str:
     return f"ims.mnc{str(mnc).zfill(3)}.mcc{str(mcc)}.3gppnetwork.org"
 
 
-def advertise_address(settings: dict) -> str:
-    """The host-reachable address to advertise to local SIP clients. Precedence: explicit
-    TLS domain (already used as the TLS external address) > VOWIFI_ADVERTISE_ADDR env >
-    settings.advertise_address > auto-detected host LAN IPv4.
+def normalize_advertise_address(value) -> str:
+    """Strip and lightly validate an advertise host. Empty means automatic detection."""
+    value = ("" if value is None else str(value)).strip()
+    if not value:
+        return ""
+    if any(ch.isspace() for ch in value) or "://" in value:
+        raise ValueError(
+            "advertise_address must be a bare IP address or hostname "
+            "(for example 192.168.6.239), not a URL"
+        )
+    return value
 
-    The env override matters when the control plane itself runs in a (bridge-networked)
-    container: _host_lan_ipv4() would then return the container's docker-bridge IP, not the
-    host LAN IP a SIP/WebRTC client must reach. The installer passes the real host IP in
-    VOWIFI_ADVERTISE_ADDR."""
-    tls_domain = (settings.get("tls", {}) or {}).get("domain", "")
-    return (tls_domain or os.environ.get("VOWIFI_ADVERTISE_ADDR", "")
-            or settings.get("advertise_address", "") or _host_lan_ipv4())
+
+def advertise_address_managed_by_env() -> bool:
+    return bool((os.environ.get("VOWIFI_ADVERTISE_ADDR") or "").strip())
+
+
+def advertise_address(settings: dict) -> str:
+    """Resolve the address advertised to local SIP clients.
+
+    Precedence is installer/environment pin > stored Settings value > TLS domain >
+    LAN auto-detection. The environment override must win even when TLS has a domain,
+    because multi-homed installations use it to pin the host-side RTP/Contact address.
+    """
+    env = normalize_advertise_address(os.environ.get("VOWIFI_ADVERTISE_ADDR", ""))
+    if env:
+        return env
+    stored = normalize_advertise_address(settings.get("advertise_address", ""))
+    if stored:
+        return stored
+    tls_domain = ((settings.get("tls", {}) or {}).get("domain") or "").strip()
+    if tls_domain:
+        return tls_domain
+    return _host_lan_ipv4() or ""
 
 
 def _ensure():
@@ -174,11 +262,54 @@ def get_settings() -> dict:
     return load()["settings"]
 
 
+def public_settings() -> dict:
+    """Settings payload for the WebUI, including resolved advertise-address diagnostics."""
+    settings = get_settings()
+    try:
+        stored = normalize_advertise_address(settings.get("advertise_address", ""))
+    except ValueError:
+        # Do not let a malformed legacy value make the Settings endpoint unusable.
+        stored = ""
+    settings["advertise_address"] = stored
+    settings["advertise_address_effective"] = advertise_address(settings)
+    settings["advertise_address_managed_by_env"] = advertise_address_managed_by_env()
+    settings["advertise_address_detected"] = _host_lan_ipv4() or ""
+    return settings
+
+
 def update_settings(patch: dict) -> dict:
     data = load()
+    patch = dict(patch or {})
+    for key in ("advertise_address_effective", "advertise_address_managed_by_env",
+                "advertise_address_detected"):
+        patch.pop(key, None)
+    if "advertise_address" in patch:
+        patch["advertise_address"] = normalize_advertise_address(
+            patch.get("advertise_address")
+        )
+    try:
+        previous = normalize_advertise_address(
+            data["settings"].get("advertise_address", "")
+        )
+    except ValueError:
+        previous = ""
     data["settings"].update(patch)
     save(data)
-    return data["settings"]
+    try:
+        current = normalize_advertise_address(
+            data["settings"].get("advertise_address", "")
+        )
+    except ValueError:
+        current = ""
+    # Refresh the host-mounted instance.json files. Running Asterisk instances still need
+    # an explicit Stop -> Start; this makes the new address ready for that next start.
+    if "advertise_address" in patch or current != previous:
+        for inst in list((data.get("instances") or {}).values()):
+            try:
+                write_instance_json(inst, data["settings"])
+            except Exception:
+                pass
+    return public_settings()
 
 
 def list_instances() -> list:
@@ -307,6 +438,76 @@ def next_index(data: dict) -> int:
     return i
 
 
+_SIP_RESERVED_USERNAMES = frozenset({
+    "global", "system", "volte_ims",
+    "endpoint-local", "auth-local", "aor-local",
+    "transport-local", "transport-wss",
+})
+
+
+def validate_sip_external_usernames(sip: dict | None) -> None:
+    """Reject external SIP names that would collide in the rendered pjsip config."""
+    sip = sip or {}
+    external = sip.get("external") or []
+    webrtc_user = str(
+        ((sip.get("webrtc") or {}).get("username") or "webrtc")
+    ).strip()
+    reserved = set(_SIP_RESERVED_USERNAMES)
+    if webrtc_user:
+        reserved.add(webrtc_user)
+
+    seen: dict[str, int] = {}
+    for index, account in enumerate(external):
+        if not isinstance(account, dict):
+            continue
+        username = str(account.get("username") or "").strip()
+        if not username:
+            continue
+        if username in reserved:
+            raise ValueError(
+                f"SIP username '{username}' is reserved (used by the built-in "
+                "softphone or Asterisk internals). Choose a different name."
+            )
+        previous = seen.get(username)
+        if previous is not None:
+            raise ValueError(
+                f"SIP username '{username}' is used more than once on this line "
+                f"(accounts #{previous + 1} and #{index + 1}). Each account needs "
+                "a unique username."
+            )
+        seen[username] = index
+
+
+def merge_external_sip_accounts(new_list, old_list) -> list:
+    """Preserve an external SIP secret when a save omits or blanks its password."""
+    old_by_username = {}
+    for account in old_list or []:
+        if not isinstance(account, dict):
+            continue
+        username = str(account.get("username") or "").strip()
+        if username:
+            old_by_username[username] = account
+
+    merged = []
+    for account in new_list or []:
+        if not isinstance(account, dict):
+            continue
+        username = str(account.get("username") or "").strip()
+        if not username:
+            continue
+        if "password" in account and str(account.get("password") or "").strip():
+            password = str(account.get("password"))
+        else:
+            password = str((old_by_username.get(username) or {}).get("password") or "")
+        if not password:
+            raise ValueError(
+                f"SIP account '{username}' needs a password "
+                "(third-party SIP clients will get Unauthorized without one)."
+            )
+        merged.append({**account, "username": username, "password": password})
+    return merged
+
+
 def upsert_instance(inst: dict) -> dict:
     data = load()
     iid = str(inst["id"])
@@ -337,6 +538,22 @@ def upsert_instance(inst: dict) -> dict:
         inst.pop("pin", None)
         if existing.get("pin"):
             inst["pin"] = existing["pin"]
+    # Merge SIP settings one level deeper than the instance itself. In particular, a
+    # password field intentionally omitted by the WebUI must keep the saved credential.
+    if "sip" in inst:
+        old_sip = existing.get("sip") or {}
+        new_sip = inst.get("sip") or {}
+        merged_sip = {**old_sip, **new_sip}
+        if "webrtc" in old_sip or "webrtc" in new_sip:
+            merged_sip["webrtc"] = {
+                **(old_sip.get("webrtc") or {}),
+                **(new_sip.get("webrtc") or {}),
+            }
+        if "external" in new_sip:
+            merged_sip["external"] = merge_external_sip_accounts(
+                new_sip.get("external"), old_sip.get("external")
+            )
+        inst["sip"] = merged_sip
     merged = {**existing, **inst}
     # Ensure a STABLE WebRTC softphone credential (used by both the Asterisk config and
     # the softphone provisioning endpoint — they must match).
@@ -346,6 +563,7 @@ def upsert_instance(inst: dict) -> dict:
     if not wr.get("password"):
         prev = (existing.get("sip", {}) or {}).get("webrtc", {}) or {}
         wr["password"] = prev.get("password") or secrets.token_urlsafe(12)
+    validate_sip_external_usernames(sip)
     data["instances"][iid] = merged
     save(data)
     return merged

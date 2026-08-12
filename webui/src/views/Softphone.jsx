@@ -43,6 +43,7 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
   const [dtmfSeq, setDtmfSeq] = useState('')   // digits/symbols entered since the keypad opened
   const [recording, setRecording] = useState(false)
   const [calls, setCalls] = useState([])
+  const [mobilePane, setMobilePane] = useState('phone')
   const [callSelMode, setCallSelMode] = useState(false)
   const [callSel, setCallSel] = useState(() => new Set())
   const phone = useRef(null)
@@ -50,18 +51,30 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
   // unlockAudio) is what makes remote WebRTC audio play under Chrome/Edge autoplay policy.
   const audioRef = useRef(null)
 
-  const loadCalls = useCallback(() => { if (id) api.calls(id).then((r) => setCalls(r.calls || [])).catch(() => {}) }, [id])
+  const loadCalls = useCallback(() => {
+    if (id == null || id === '') return
+    api.calls(id).then((r) => setCalls(r.calls || [])).catch(() => {})
+  }, [id])
   useEffect(() => { loadCalls() }, [loadCalls])
-  useEffect(() => { setCallSelMode(false); setCallSel(new Set()) }, [id])
+  useEffect(() => {
+    setCallSelMode(false); setCallSel(new Set()); setMobilePane('phone')
+  }, [id])
   // if the list empties (own delete, or another client's clear-all over WS), leave select
   // mode so the toolbar/checkbox UI can't get stranded on an empty list.
   useEffect(() => { if (!calls.length) { setCallSelMode(false); setCallSel(new Set()) } }, [calls.length])
-  useEffect(() => subscribe && subscribe((m) => { if (m.type === 'call' && m.instance === id) loadCalls() }), [subscribe, id, loadCalls])
+  useEffect(() => subscribe && subscribe((m) => {
+    if (m.type === 'call' && String(m.instance) === String(id)) loadCalls()
+  }), [subscribe, id, loadCalls])
+  useEffect(() => {
+    if (call?.state === 'ended') loadCalls()
+  }, [call?.state, loadCalls])
 
   const toast = (m) => (showToast ? showToast(m) : null)
   const toggleCallSel = (cid) => setCallSel((s) => { const n = new Set(s); n.has(cid) ? n.delete(cid) : n.add(cid); return n })
   // Reload only if still on the same line (a delete may resolve after the user switched SIMs).
-  const reloadIfSame = (forId) => { if (forId === id) loadCalls() }
+  const reloadIfSame = (forId) => {
+    if (String(forId) === String(id)) loadCalls()
+  }
 
   const deleteSelectedCalls = async () => {
     if (!callSel.size) return
@@ -98,7 +111,6 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
     setCall((c) => c ? { ...c, state: 'ended', endCause } : null)
     setKeypad(false); setMuted(false); setRecording(false)
     setTimeout(() => setCall(null), 2500)
-    loadCalls()
   }
 
   const connect = useCallback(() => {
@@ -245,19 +257,30 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
   ) : null
 
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+    <div className="softphone-page" style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {/* Persistent remote-audio sink: JsSIP writes the remote MediaStream here. autoPlay +
           a stable DOM element + unlockAudio() on the first click = reliable playback. */}
       <audio ref={audioRef} autoPlay playsInline style={{ display: 'none' }} />
       <div style={{ flexShrink: 0 }}>
         <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} />
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
+      <div className="mobile-softphone-tabs">
+        <button type="button" className={`btn ${mobilePane === 'phone' ? 'btn-primary' : 'btn-ghost'}`}
+          onClick={() => setMobilePane('phone')}>Phone</button>
+        <button type="button" className={`btn ${mobilePane === 'history' ? 'btn-primary' : 'btn-ghost'}`}
+          onClick={() => setMobilePane('history')}>Recent</button>
+        <div className="mobile-reg" style={{ color: regColor }} title={reg}>
+          <span style={{ width: 7, height: 7, borderRadius: 999, background: regColor, flexShrink: 0 }} />
+          <span>{reg}</span>
+        </div>
+      </div>
+      <div className={`split-pane softphone ${mobilePane === 'history' ? 'is-detail' : 'is-list'}`}
+        style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
       {IncomingOverlay}
       <style>{`@keyframes ringpulse{0%{box-shadow:0 0 0 0 ${GREEN}88}70%{box-shadow:0 0 0 16px ${GREEN}00}100%{box-shadow:0 0 0 0 ${GREEN}00}}`}</style>
       {/* ---- Phone panel (Google-Voice style) ---- */}
-      <div className="card" style={{ padding: 24, minHeight: 520, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+      <div className="card pane-list softphone-phone" style={{ padding: 24, minHeight: 520, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <div className="softphone-meta" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, flexShrink: 0 }}>
           <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>Softphone</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: regColor }}>
             <span style={{ width: 8, height: 8, borderRadius: 999, background: regColor }} />{reg}
@@ -288,15 +311,15 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
 
         {/* ===== IN CALL ===== */}
         {call?.state === 'active' && (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', textAlign: 'center', gap: 14 }}>
-            <Avatar label={call.number} color={GREEN} size={84} />
-            <div>
-              <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number || 'Unknown'}</div>
+          <div className="softphone-active" style={{ flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', flexDirection: 'column', justifyContent: keypad ? 'flex-start' : 'center', textAlign: 'center', gap: 12, paddingBottom: 8 }}>
+            {!keypad && <Avatar label={call.number} color={GREEN} size={84} />}
+            <div style={{ flexShrink: 0 }}>
+              <div className="mono" style={{ fontSize: keypad ? 16 : 20, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%' }}>{call.number || 'Unknown'}</div>
               <div style={{ fontSize: 15, color: GREEN, marginTop: 4, fontVariantNumeric: 'tabular-nums' }}>{fmtDur(dur)}</div>
               {recording && <div style={{ fontSize: 12, color: RED, marginTop: 2 }}>● Recording</div>}
             </div>
             {keypad && (
-              <div style={{ maxWidth: 220, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ width: '100%', maxWidth: 240, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 8, flexShrink: 0 }}>
                 {/* Echo strip: shows every digit/symbol entered via click or physical keyboard */}
                 <div className="mono" style={{ minHeight: 40, padding: '8px 12px', borderRadius: 8,
                   background: 'var(--surface-2, rgba(255,255,255,0.06))', border: '1px solid var(--border, rgba(255,255,255,0.12))',
@@ -304,20 +327,20 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
                   direction: 'rtl', color: dtmfSeq ? 'var(--text)' : 'var(--text-mute)' }}>
                   {dtmfSeq || 'Type or tap keys'}
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
+                <div className="dtmf-pad">
                   {KEYS.map(([k]) => (
-                    <button key={k} className="btn btn-ghost" style={{ padding: 12, fontSize: 18 }}
+                    <button key={k} className="dial-key"
                       onClick={() => pressDTMF(k)}>{k}</button>
                   ))}
                 </div>
               </div>
             )}
-            <div style={{ display: 'flex', justifyContent: 'center', gap: 22, marginTop: 8 }}>
+            <div style={{ display: 'flex', justifyContent: 'center', gap: 22, marginTop: 4, flexShrink: 0 }}>
               <RoundBtn icon={muted ? '🔇' : '🎙'} label={muted ? 'Unmute' : 'Mute'} color="#60a5fa" onClick={toggleMute} active={muted} />
               <RoundBtn icon="⌨" label="Keypad" color="#a78bfa" onClick={() => setKeypad((v) => !v)} active={keypad} />
               <RoundBtn icon="⏺" label={recording ? 'Stop' : 'Record'} color={RED} onClick={toggleRecord} active={recording} />
             </div>
-            <div style={{ display: 'flex', justifyContent: 'center', marginTop: 6 }}>
+            <div style={{ display: 'flex', justifyContent: 'center', marginTop: 2, flexShrink: 0 }}>
               <RoundBtn icon="✕" label="Hang up" color="#fff" bg={RED} onClick={hangup} />
             </div>
           </div>
@@ -334,27 +357,27 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
 
         {/* ===== DIALER (idle) ===== */}
         {!inCall && (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+          <div className="softphone-idle" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
             <input value={num} onChange={(e) => setNum(e.target.value)} placeholder="Enter a number"
-              className="mono" style={{ fontSize: 24, textAlign: 'center', margin: '10px 0 16px', letterSpacing: 1, border: 'none', background: 'transparent' }} />
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10 }}>
+              className="mono softphone-num" style={{ fontSize: 24, textAlign: 'center', margin: '10px 0 16px', letterSpacing: 1, border: 'none', background: 'transparent', minHeight: 48 }} />
+            <div className="dial-pad">
               {KEYS.map(([k, sub]) => (
-                <button key={k} onClick={() => dialKey(k)} style={{
-                  padding: '10px 0', borderRadius: 12, cursor: 'pointer', background: 'var(--hover)',
-                  border: '1px solid var(--border)', color: 'var(--text)', display: 'flex', flexDirection: 'column', alignItems: 'center',
+                <button key={k} className="dial-key" onClick={() => dialKey(k)} style={{
+                  padding: '8px 0', borderRadius: 12, cursor: 'pointer', background: 'var(--hover)',
+                  border: '1px solid var(--border)', color: 'var(--text)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
                 }}>
-                  <span style={{ fontSize: 22, fontWeight: 600 }}>{k}</span>
-                  <span style={{ fontSize: 9, color: 'var(--text-mute)', letterSpacing: 1, height: 10 }}>{sub}</span>
+                  <span style={{ fontSize: 22, fontWeight: 600, lineHeight: 1.1 }}>{k}</span>
+                  <span style={{ fontSize: 9, color: 'var(--text-mute)', letterSpacing: 1, height: 12, lineHeight: '12px' }}>{sub || '\u00a0'}</span>
                 </button>
               ))}
             </div>
-            <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 24, marginTop: 16 }}>
+            <div className="softphone-actions" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 24, marginTop: 16, flexShrink: 0 }}>
               <div style={{ width: 58 }} />
-              <button onClick={placeCall} disabled={reg !== 'registered' || !num} style={{
+              <button className="call-fab" onClick={placeCall} disabled={reg !== 'registered' || !num} style={{
                 width: 64, height: 64, borderRadius: '50%', border: 'none', cursor: 'pointer', fontSize: 26,
                 background: (reg === 'registered' && num) ? GREEN : 'var(--border-strong)', color: '#fff',
               }}>✆</button>
-              <button onClick={() => setNum((n) => n.slice(0, -1))} style={{
+              <button className="icon-action" onClick={() => setNum((n) => n.slice(0, -1))} style={{
                 width: 58, height: 58, borderRadius: '50%', border: 'none', background: 'transparent',
                 color: 'var(--text-mute)', cursor: 'pointer', fontSize: 22, visibility: num ? 'visible' : 'hidden',
               }}>⌫</button>
@@ -364,7 +387,7 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
       </div>
 
       {/* ---- Recent calls ---- */}
-      <div className="card" style={{ padding: 20, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      <div className="card pane-detail softphone-history" style={{ padding: 20, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexShrink: 0 }}>
           <div style={{ fontSize: 15, fontWeight: 600 }}>Recent calls</div>
           {calls.length > 0 && (
@@ -393,7 +416,10 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
             const color = s === 'answered' ? GREEN : (s === 'rejected' || s === 'busy' || s === 'failed') ? RED
               : (s === 'no answer' || s === 'cancelled' || s === 'missed') ? '#eab308' : 'var(--text-dim)'
             const dlabel = c.direction === 'in' ? '↙ Incoming' : '↗ Outgoing'
+            const peer = (c.peer || '').trim()
+            const peerLabel = peer || 'Private number'
             const checked = callSel.has(c.id)
+            const when = c.start_ts ? new Date(Number(c.start_ts) * 1000).toLocaleString() : ''
             return (
               <div key={c.id} onClick={() => callSelMode && toggleCallSel(c.id)} className="hover-row"
                 style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8,
@@ -401,14 +427,16 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
                   background: checked ? 'var(--active)' : 'var(--input-bg)' }}>
                 {callSelMode && <input type="checkbox" readOnly checked={checked} style={{ width: 'auto', flexShrink: 0 }} />}
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="mono" style={{ fontWeight: 600 }}>{c.peer}</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-mute)' }}>{dlabel} · {new Date(c.start_ts * 1000).toLocaleString()}</div>
+                  <div className="mono" style={{ fontWeight: 600, color: peer ? undefined : 'var(--text-mute)' }}>{peerLabel}</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-mute)' }}>{dlabel}{when ? ` · ${when}` : ''}</div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <span style={{ color, fontWeight: 600, textTransform: 'capitalize' }}>{c.status || 'ringing'}</span>
                   {!callSelMode && <>
                     <button className="btn btn-ghost" style={{ padding: '5px 10px' }}
-                      disabled={reg !== 'registered'} onClick={(e) => { e.stopPropagation(); phone.current?.unlockAudio(); setNum(c.peer); phone.current?.call(c.peer) }}>Call</button>
+                      disabled={reg !== 'registered' || !peer} onClick={(e) => {
+                        e.stopPropagation(); phone.current?.unlockAudio(); setNum(peer); phone.current?.call(peer)
+                      }}>Call</button>
                     <button className="row-del" title="Delete this call" aria-label="Delete this call"
                       onClick={(e) => deleteOneCall(c.id, e)}>🗑</button>
                   </>}
