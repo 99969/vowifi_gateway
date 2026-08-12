@@ -40,7 +40,9 @@ export default function App() {
     try {
       const r = await api.instances()
       setInstances(r.instances)
-      setSelected((s) => s || (r.instances[0] && r.instances[0].id))
+      setSelected((s) => s != null && s !== ''
+        ? String(s)
+        : (r.instances[0] ? String(r.instances[0].id) : null))
     } catch (e) { /* manager may be starting */ }
     try { const c = await api.cards(); setCards(c.cards); setCardsKnown(true) } catch {}
   }, [])
@@ -55,7 +57,9 @@ export default function App() {
         // state/label/detail — otherwise a live status push would drop the failure reason
         // that the initial /api/instances fetch showed, making the error banner vanish.
         const { type, instance, ...status } = msg
-        setInstances((list) => list.map((i) => i.id === instance ? { ...i, status } : i))
+        setInstances((list) => list.map((i) => String(i.id) === String(instance)
+          ? { ...i, status }
+          : i))
       }
       if (msg.type === 'cards') { setCards(msg.cards); setCardsKnown(true) }
       if (msg.type === 'engine' && ['card_removed', 'reader_lost', 'reader_added', 'reader_removed'].includes(msg.event)) {
@@ -98,30 +102,30 @@ export default function App() {
     if (noReaders && !NAV.find(([k]) => k === view)?.[3]) setView('dashboard')
   }, [noReaders, view])
 
-  const sel = instances.find((i) => i.id === selected)
+  const sel = instances.find((i) => String(i.id) === String(selected))
 
   const View = { dashboard: Dashboard, softphone: Softphone, messages: Messages, sims: SimConfig, esim: Esim, settings: Settings, logs: Logs }[view]
 
   return (
-    <div style={{ display: 'flex', height: '100%' }}>
-      <aside style={{ width: 220, background: 'var(--sidebar)', borderRight: '1px solid var(--border)', padding: 16, display: 'flex', flexDirection: 'column', gap: 6 }}>
-        <div style={{ fontWeight: 800, fontSize: 18, padding: '4px 8px 16px', letterSpacing: .5 }}>
+    <div className="app-shell" style={{ display: 'flex', height: '100%' }}>
+      <aside className="app-sidebar" style={{ width: 220, background: 'var(--sidebar)', borderRight: '1px solid var(--border)', padding: 16, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div className="app-brand" style={{ fontWeight: 800, fontSize: 18, padding: '4px 8px 16px', letterSpacing: .5 }}>
           <span style={{ color: '#3b82f6' }}>Vo</span>WiFi<span style={{ color: 'var(--text-mute)', fontWeight: 500 }}> gateway</span>
         </div>
         {NAV.map(([k, label, icon, always]) => {
           const disabled = noReaders && !always
           return (
-            <button key={k} onClick={() => !disabled && setView(k)} disabled={disabled}
+            <button className="app-nav-button" key={k} onClick={() => !disabled && setView(k)} disabled={disabled}
               title={disabled ? 'No PC/SC reader detected — connect a card reader to enable' : undefined}
               style={{ textAlign: 'left', padding: '10px 12px', borderRadius: 10, cursor: disabled ? 'not-allowed' : 'pointer',
                 background: view === k ? 'var(--active)' : 'transparent', color: view === k ? '#fff' : 'var(--text-dim)',
                 opacity: disabled ? .35 : 1,
                 border: 'none', fontSize: 14, fontWeight: 600, display: 'flex', gap: 10, alignItems: 'center' }}>
-              <span style={{ width: 18, textAlign: 'center' }}>{icon}</span>{label}
+              <span style={{ width: 18, textAlign: 'center' }}>{icon}</span><span className="app-nav-label">{label}</span>
             </button>
           )
         })}
-        <div style={{ marginTop: 'auto', display: 'flex', gap: 6, padding: 8 }}>
+        <div className="app-theme-picker" style={{ marginTop: 'auto', display: 'flex', gap: 6, padding: 8 }}>
           {[['auto', '🌗'], ['light', '☀'], ['dark', '🌙']].map(([t, icon]) => (
             <button key={t} onClick={() => setTheme(t)} title={`${t} theme`}
               style={{
@@ -132,13 +136,13 @@ export default function App() {
               }}>{icon} {t}</button>
           ))}
         </div>
-        <div style={{ fontSize: 11, color: 'var(--text-faint)', padding: '0 8px 8px' }}>
+        <div className="app-instance-count" style={{ fontSize: 11, color: 'var(--text-faint)', padding: '0 8px 8px' }}>
           {instances.length} SIM{instances.length !== 1 ? 's' : ''} configured
         </div>
       </aside>
 
-      <main style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16, gap: 16, flexShrink: 0, padding: '24px 24px 0' }}>
+      <main className="app-main" style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        <div className="app-header" style={{ display: 'flex', alignItems: 'center', marginBottom: 16, gap: 16, flexShrink: 0, padding: '24px 24px 0' }}>
           <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0, textTransform: 'capitalize' }}>{view}</h1>
           {/* per-page SIM selectors (SimSelector) handle multi-SIM switching on the views that
               operate on a single line — softphone / messages / logs / SIM config */}
@@ -148,7 +152,7 @@ export default function App() {
             own inner lists instead, so the page height never grows with list length. The
             padding also gives card outlines/shadows room so overflow:auto doesn't clip them
             (e.g. the Dashboard active-reader ring on the top/left edge). */}
-        <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: '6px 24px 24px' }}>
+        <div className="app-content" style={{ flex: 1, minHeight: 0, overflowX: 'hidden', overflowY: 'auto', padding: '6px 24px 24px' }}>
           {View && <View instances={instances} cards={cards} noReaders={noReaders} cardsKnown={cardsKnown} selected={sel} setSelected={setSelected} refresh={refresh} subscribe={subscribe} showToast={showToast} setView={setView} />}
         </div>
       </main>

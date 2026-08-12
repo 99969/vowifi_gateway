@@ -9,6 +9,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   const [msgs, setMsgs] = useState([])
   const [text, setText] = useState('')
   const [newTo, setNewTo] = useState('')
+  const [composing, setComposing] = useState(false)
   const [sending, setSending] = useState(false)
   const [selMode, setSelMode] = useState(false)      // multi-select messages to delete
   const [selIds, setSelIds] = useState(() => new Set())
@@ -31,7 +32,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   // (rendered only while msgs.length>0) can't strand the UI in select state.
   useEffect(() => { if (!msgs.length) { setSelMode(false); setSelIds(new Set()) } }, [msgs.length])
   useEffect(() => subscribe((msg) => {
-    if (msg.type === 'sms' && msg.instance === id) {
+    if (msg.type === 'sms' && String(msg.instance) === String(id)) {
       loadThreads()
       if (peer) loadMsgs(peer)
     }
@@ -43,7 +44,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     setSending(true)
     try {
       const res = await api.sendSms(id, to, text)
-      setText(''); setPeer(to); setNewTo('')
+      setText(''); setPeer(to); setNewTo(''); setComposing(false)
       await loadThreads(); await loadMsgs(to)
       if (res && res.ok === false) {
         const msg = 'SMS not delivered: ' + (res.error || 'unknown error')
@@ -64,7 +65,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   // The awaited delete may resolve after the user switched SIM lines — only refresh if
   // we're still on the same line, so we don't write the old line's data into state.
   const refreshIfSame = async (forId, p) => {
-    if (forId !== id) return
+    if (String(forId) !== String(id)) return
     await loadThreads(); if (p) await loadMsgs(p)
   }
 
@@ -86,8 +87,8 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     const forId = id
     try {
       await api.deleteMessages(forId, { peer: p })
-      if (peer === p) { setPeer(null); setMsgs([]) }
-      if (forId === id) await loadThreads()
+      if (peer === p) { setPeer(null); setMsgs([]); setComposing(false) }
+      if (String(forId) === String(id)) await loadThreads()
       toast('Conversation deleted')
     } catch (e2) { toast('Delete failed: ' + e2.message) }
   }
@@ -98,7 +99,9 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     const forId = id
     try {
       await api.deleteMessages(forId, { all: true })
-      if (forId === id) { setPeer(null); setMsgs([]); await loadThreads() }
+      if (String(forId) === String(id)) {
+        setPeer(null); setMsgs([]); setComposing(false); await loadThreads()
+      }
       toast('All messages deleted')
     } catch (e) { toast('Delete failed: ' + e.message) }
   }
@@ -111,22 +114,25 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   )
 
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+    <div className="messages-page" style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <div style={{ flexShrink: 0 }}>
         <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} />
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
-      <div className="card" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
-        <button className="btn btn-primary" style={{ width: '100%', marginBottom: 8 }} onClick={() => { setPeer(null); setMsgs([]) }}>+ New message</button>
+      <div className={`split-pane messages-split ${peer || composing ? 'is-detail' : 'is-list'}`}
+        style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
+      <div className="card pane-list" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
+        <button className="btn btn-primary" style={{ width: '100%', marginBottom: 8 }} onClick={() => {
+          setPeer(null); setMsgs([]); setComposing(true)
+        }}>+ New message</button>
         {threads.length > 0 &&
           <button className="btn btn-ghost" style={{ width: '100%', marginBottom: 10, color: '#ef4444', fontSize: 12 }}
             onClick={clearAll}>Clear all conversations</button>}
         {threads.map((t) => (
-          <div key={t.peer} onClick={() => setPeer(t.peer)} className="hover-row"
+          <div key={t.peer} onClick={() => { setPeer(t.peer); setComposing(false) }} className="hover-row"
             style={{ padding: 10, borderRadius: 10, cursor: 'pointer', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8,
               background: peer === t.peer ? 'var(--active)' : 'transparent' }}>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: 14 }} className="mono">{t.peer}</div>
+              <div style={{ fontWeight: 600, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} className="mono">{t.peer}</div>
               <div style={{ fontSize: 12, color: 'var(--text-mute)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.last_body}</div>
             </div>
             <button className="row-del" title="Delete conversation" aria-label={`Delete conversation with ${t.peer}`}
@@ -136,10 +142,18 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
         {threads.length === 0 && <div style={{ color: 'var(--text-mute)', fontSize: 13, padding: 8 }}>No conversations yet.</div>}
       </div>
 
-      <div className="card" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0 }}>
-        <div style={{ padding: 14, borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-          {peer ? <span className="mono" style={{ fontWeight: 600, flex: 1 }}>{peer}</span>
-            : <input placeholder="Recipient number e.g. +1..." value={newTo} onChange={(e) => setNewTo(e.target.value)} style={{ maxWidth: 300, flex: 1 }} />}
+      <div className="card pane-detail" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
+        <div style={{ padding: 14, borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, minWidth: 0, flexWrap: 'wrap' }}>
+          <button type="button" className="btn btn-ghost messages-back" onClick={() => {
+            setPeer(null); setComposing(false); setMsgs([])
+          }}>← Back</button>
+          {peer ? <span className="mono" style={{
+            fontWeight: 600, flex: '1 1 120px', minWidth: 0, overflow: 'hidden',
+            textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>{peer}</span>
+            : <input placeholder="Recipient number e.g. +1..." value={newTo}
+              onChange={(e) => setNewTo(e.target.value)}
+              style={{ maxWidth: '100%', flex: '1 1 160px', minWidth: 0 }} />}
           {peer && msgs.length > 0 && (
             selMode ? (
               <>
@@ -159,7 +173,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
             )
           )}
         </div>
-        <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ flex: 1, minHeight: 0, overflowX: 'hidden', overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
           {msgs.map((m) => {
             const failed = m.status === 'failed'
             // Outbound delivery lifecycle: pending -> sent (IMS accepted) -> delivered | failed.
@@ -175,17 +189,17 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
             const statusColor = failed ? '#ef4444' : delivered ? '#22c55e' : 'var(--text-mute)'
             const checked = selIds.has(m.id)
             return (
-              <div key={m.id} onClick={() => selMode && toggleSel(m.id)}
-                style={{ alignSelf: m.direction === 'out' ? 'flex-end' : 'flex-start', maxWidth: '74%',
-                  cursor: selMode ? 'pointer' : 'default', display: 'flex', alignItems: 'center', gap: 8,
+              <div key={m.id} className="msg-row" onClick={() => selMode && toggleSel(m.id)}
+                style={{ alignSelf: m.direction === 'out' ? 'flex-end' : 'flex-start',
+                  cursor: selMode ? 'pointer' : 'default', display: 'flex', alignItems: 'flex-start', gap: 8,
                   flexDirection: m.direction === 'out' ? 'row-reverse' : 'row' }}>
-                {selMode && <input type="checkbox" readOnly checked={checked} style={{ width: 'auto', flexShrink: 0 }} />}
-                <div style={{ minWidth: 0 }}>
+                {selMode && <input type="checkbox" readOnly checked={checked} style={{ width: 'auto', flexShrink: 0, marginTop: 10 }} />}
+                <div style={{ minWidth: 0, maxWidth: '100%', flex: '1 1 auto' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6,
                     flexDirection: m.direction === 'out' ? 'row' : 'row-reverse' }}>
                     {failed && <span title={m.error || 'Delivery failed'}
                       style={{ color: '#ef4444', fontWeight: 800, cursor: 'help', fontSize: 15 }}>❗</span>}
-                    <div style={{
+                    <div className="msg-bubble" style={{
                       background: checked ? 'var(--active)' : failed ? 'rgba(239,68,68,.15)' : (m.direction === 'out' ? 'var(--primary)' : 'var(--hover)'),
                       border: failed ? '1px solid rgba(239,68,68,.55)' : '1px solid transparent',
                       padding: '8px 12px', borderRadius: 12, fontSize: 14,
@@ -197,18 +211,19 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
                     {statusText}
                   </div>
                   {failed && m.error && (
-                    <div style={{ fontSize: 10.5, color: '#ef4444', marginTop: 1,
-                      textAlign: m.direction === 'out' ? 'right' : 'left', maxWidth: 280 }}>{m.error}</div>
+                    <div className="msg-bubble" style={{ fontSize: 10.5, color: '#ef4444', marginTop: 1,
+                      textAlign: m.direction === 'out' ? 'right' : 'left', padding: 0, background: 'transparent' }}>{m.error}</div>
                   )}
                 </div>
               </div>
             )
           })}
         </div>
-        <div style={{ display: 'flex', gap: 8, padding: 12, borderTop: '1px solid var(--border)', flexShrink: 0 }}>
+        <div style={{ display: 'flex', gap: 8, padding: 12, borderTop: '1px solid var(--border)', flexShrink: 0, minWidth: 0 }}>
           <input placeholder="Type a message…" value={text} onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && send()} />
-          <button className="btn btn-primary" disabled={sending || (!peer && !newTo)} onClick={send}>Send</button>
+            onKeyDown={(e) => e.key === 'Enter' && send()} style={{ flex: 1, minWidth: 0 }} />
+          <button className="btn btn-primary" style={{ flexShrink: 0 }}
+            disabled={sending || (!peer && !newTo)} onClick={send}>Send</button>
         </div>
       </div>
       </div>
