@@ -22,7 +22,11 @@ export default function Settings() {
   const updTgEv = (k, v) => setS((x) => ({ ...x, telegram: { ...tg, events: { ...(tg.events || {}), [k]: v } } }))
 
   const save = async () => {
-    try { await api.saveSettings(s); setMsg('Saved. Restart the control surface for TLS/port changes, and re-provision a line for ring-timeout changes, to take effect.') }
+    try {
+      const next = await api.saveSettings(s)
+      setS(next)
+      setMsg('Saved. Restart the control surface for TLS/port changes. Stop → Start (or re-provision) lines for advertise-address, ring-timeout, and other engine settings.')
+    }
     catch (e) { setMsg('Error: ' + e.message) }
   }
 
@@ -41,6 +45,66 @@ export default function Settings() {
           <div />
           <div><label>Cert path</label><input className="mono" value={s.tls.cert_path || ''} onChange={(e) => updTls({ cert_path: e.target.value })} placeholder="/path/fullchain.pem" /></div>
           <div><label>Key path</label><input className="mono" value={s.tls.key_path || ''} onChange={(e) => updTls({ key_path: e.target.value })} placeholder="/path/privkey.pem" /></div>
+        </div>
+      </div>
+
+      <div className="card" style={{ padding: 20 }}>
+        <h3 style={{ marginTop: 0 }}>SIP / WebRTC advertise address</h3>
+        <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 10 }}>
+          This address is written into local SIP Contact and SDP so Linphone, MicroSIP,
+          and the browser softphone send RTP/RFC4733 DTMF back to this host. Leave it blank
+          to auto-detect a LAN NIC; on a LAN + VPN host, pin the reachable LAN IP explicitly.
+        </div>
+        {s.advertise_address_managed_by_env ? (
+          <div style={{
+            padding: '10px 12px', borderRadius: 8, marginBottom: 10,
+            background: 'var(--bg-elev, rgba(0,0,0,.08))', fontSize: 13,
+          }}>
+            <div>
+              Managed by <code>VOWIFI_ADVERTISE_ADDR</code> — effective{' '}
+              <span className="mono">{s.advertise_address_effective || '—'}</span>.
+              This page cannot override the environment value.
+            </div>
+            <div style={{ marginTop: 8, color: 'var(--text-dim)' }}>
+              To update the installer-managed value from the repository directory:
+            </div>
+            <pre className="mono" style={{
+              margin: '8px 0 0', padding: '8px 10px', borderRadius: 6,
+              overflowX: 'auto', background: 'rgba(0,0,0,.12)', fontSize: 12,
+              whiteSpace: 'pre-wrap',
+            }}>{`sudo VOWIFI_ADVERTISE_ADDR=${s.advertise_address_detected || s.advertise_address_effective || '192.168.x.x'} ./install.sh reload`}</pre>
+          </div>
+        ) : (
+          <div>
+            <label htmlFor="advertise_address">Advertise address (IP or hostname)</label>
+            <input
+              id="advertise_address"
+              className="mono"
+              value={s.advertise_address || ''}
+              onChange={(e) => upd({ advertise_address: e.target.value })}
+              placeholder={s.advertise_address_detected
+                ? `auto → ${s.advertise_address_detected}`
+                : 'auto (detect LAN IP)'}
+            />
+            <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-mute)' }}>
+              The installer can pin the same value with:
+              <pre className="mono" style={{
+                margin: '6px 0 0', padding: '8px 10px', borderRadius: 6,
+                overflowX: 'auto', background: 'rgba(0,0,0,.12)', fontSize: 12,
+                whiteSpace: 'pre-wrap',
+              }}>{`sudo VOWIFI_ADVERTISE_ADDR=${s.advertise_address_detected || '192.168.x.x'} ./install.sh reload`}</pre>
+            </div>
+          </div>
+        )}
+        <div className="mono" style={{ marginTop: 10, fontSize: 12, color: 'var(--text-mute)' }}>
+          Effective: {s.advertise_address_effective || '—'}
+          {s.advertise_address_detected
+            ? ` · detected LAN: ${s.advertise_address_detected}`
+            : ''}
+        </div>
+        <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-mute)' }}>
+          After saving or reloading the installer, Stop → Start each running line so
+          Asterisk reloads its Contact and SDP address.
         </div>
       </div>
 

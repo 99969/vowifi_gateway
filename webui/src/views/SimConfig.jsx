@@ -68,6 +68,28 @@ function previewPani(sip, mcc) {
   return parts.join(';')
 }
 
+function sipUsernameConflict(sip) {
+  const accounts = sip?.external || []
+  const webrtcUser = String(sip?.webrtc?.username || 'webrtc').trim()
+  const reserved = new Set([
+    'global', 'system', 'volte_ims', 'endpoint-local', 'auth-local', 'aor-local',
+    'transport-local', 'transport-wss', webrtcUser,
+  ].filter(Boolean))
+  const seen = new Map()
+  for (let i = 0; i < accounts.length; i++) {
+    const username = String(accounts[i]?.username || '').trim()
+    if (!username) continue
+    if (reserved.has(username)) {
+      return `SIP username '${username}' is reserved for the built-in softphone or Asterisk.`
+    }
+    if (seen.has(username)) {
+      return `SIP username '${username}' is used more than once (accounts #${seen.get(username) + 1} and #${i + 1}).`
+    }
+    seen.set(username, i)
+  }
+  return ''
+}
+
 export default function SimConfig({ instances, selected, refresh, cards, setSelected }) {
   const [readers, setReaders] = useState([])
   const [card, setCard] = useState(null)
@@ -149,6 +171,8 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   const save = async () => {
     setSaving(true)
     try {
+      const sipError = sipUsernameConflict(form.sip)
+      if (sipError) throw new Error(sipError)
       const body = { ...form, mnc: String(form.mnc).padStart(3, '0') }
       // Strip runtime-only fields that ride along on the instance object from /api/instances
       // (they are computed per-request, not config — never persist them).
@@ -158,12 +182,28 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       // here; only then do we forward it to update the saved credential.
       delete body.pin
       if (pin) body.pin = pin
+      // An empty password field means "keep the saved secret", not "replace it with
+      // empty". A deliberate password change is sent normally.
+      if (body.sip) {
+        body.sip = {
+          ...body.sip,
+          external: (body.sip.external || []).map((account) => {
+            const row = { username: account.username || '' }
+            if (String(account.password || '').trim()) row.password = account.password
+            return row
+          }),
+        }
+      }
       const res = await api.saveInstance(body)
       await refresh()
-      // A running line is restarted server-side to apply the new config (pjsip accounts,
-      // IMEI, SMSC, User-Agent…); a stopped line just saves.
-      setPinMsg(res?.applied ? 'Saved — restarting the line to apply changes…' : 'Saved.')
-    } catch (e) { alert(e.message) }
+      if (res?.restart_required) {
+        const message = 'Saved. Restart this line (Stop → Start) for SIP, IMEI, and softphone changes to take effect.'
+        setPinMsg(message)
+        alert(message)
+      } else {
+        setPinMsg('Saved.')
+      }
+    } catch (e) { setPinMsg(e.message); alert(e.message) }
     setSaving(false)
   }
 
@@ -187,6 +227,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
 
   const addAccount = () => updSip({ external: [...(form.sip.external || []), { username: '', password: '' }] })
   const setAccount = (i, k, v) => updSip({ external: form.sip.external.map((a, idx) => idx === i ? { ...a, [k]: v } : a) })
+  const sipUserError = sipUsernameConflict(form.sip)
 
   return (
     <div style={{ maxWidth: 1000 }}>
@@ -232,7 +273,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
               : 'No PIN saved — you\'ll be asked for it when the line is started (if the SIM requires one).'}
           </div>
         )}
-        {pinMsg && <div style={{ fontSize: 13, marginTop: 10, color: pinMsg.includes('OK') || pinMsg.includes('read') || pinMsg === 'Saved.' || pinMsg.includes('deleted') ? '#22c55e' : '#eab308' }}>{pinMsg}</div>}
+        {pinMsg && <div style={{ fontSize: 13, marginTop: 10, color: pinMsg.includes('OK') || pinMsg.includes('read') || pinMsg.startsWith('Saved.') || pinMsg.includes('deleted') ? '#22c55e' : '#eab308' }}>{pinMsg}</div>}
       </div>
 
       {/* Instance form */}
@@ -374,12 +415,20 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
 
         <div style={{ marginTop: 12 }}>
           <label>External SIP accounts</label>
+          <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 6 }}>
+            Each account needs a unique username and cannot reuse an Asterisk or WebRTC name.
+          </div>
           {(form.sip.external || []).map((a, i) => (
             <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
               <input placeholder="username" value={a.username} onChange={(e) => setAccount(i, 'username', e.target.value)} />
-              <input placeholder="password" value={a.password} onChange={(e) => setAccount(i, 'password', e.target.value)} />
+              <input type="password" placeholder="password" value={a.password} onChange={(e) => setAccount(i, 'password', e.target.value)} />
             </div>
           ))}
+          {sipUserError && (
+            <div style={{ color: '#ef4444', fontSize: 12.5, marginTop: 6 }} role="alert">
+              {sipUserError}
+            </div>
+          )}
           <button className="btn btn-ghost" onClick={addAccount}>+ Add account</button>
         </div>
 
